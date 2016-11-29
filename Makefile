@@ -42,8 +42,7 @@ include $(RTE_SDK)/mk/rte.vars.mk
 APP = dpdk-probe
 
 # all source are stored in SRCS-y
-SRCS-y := dpdk-udp.c
-#SRCS-y += dpdk-pool.c
+SRCS-y := dpdk-probe.c
 
 CFLAGS += $(WERROR_FLAGS)
 
@@ -53,11 +52,9 @@ ifeq ($(CONFIG_RTE_TOOLCHAIN_GCC),y)
 CFLAGS_main.o += -Wno-return-type
 endif
 
-EXTRA_CFLAGS += -O3 -g -Wfatal-errors
+EXTRA_CFLAGS += -O3 -g
 
-ifneq ($(WEKA_API),)
-SRCS-y += mempool_alloc.c
-EXTRA_CFLAGS += -DWEKA_API
-endif
+#CFLAGS := $(filter-out -Werror,$(CFLAGS))
+CFLAGS := $(filter-out -Wcast-qual,$(CFLAGS))
 
 include $(RTE_SDK)/mk/rte.extapp.mk

@@ -7,5 +7,7 @@ struct rte_mempool *weka_init_mbuf_pool(uint32_t size, uint32_t align,
         uint32_t data_room_size, uint32_t priv_size, uint32_t cache_size, int socket_id,
         const char *pool_name, const char *pool_ops_name);
 
+int __rping_main(int argc, char *argv[]);
+int rping_runner(void);
 
 #endif /** __DPDK_PROBE_H___ */
