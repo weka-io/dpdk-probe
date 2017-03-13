@@ -33,8 +33,13 @@ ifeq ($(RTE_SDK),)
 $(error "Please define RTE_SDK environment variable")
 endif
 
+ifeq ($(TLDK_ROOT),)
+$(error "Please define TLDK_ROOT environment variable")
+endif
+
 # Default target, can be overridden by command line or environment
 RTE_TARGET ?= x86_64-native-linuxapp-gcc
+TLDK_OUTPUT = $(TLDK_ROOT)/$(RTE_TARGET)
 
 include $(RTE_SDK)/mk/rte.vars.mk
 
@@ -44,7 +49,11 @@ APP = dpdk-probe
 # all source are stored in SRCS-y
 SRCS-y := dpdk-probe.c
 
-CFLAGS += $(WERROR_FLAGS)
+CFLAGS += $(WERROR_FLAGS) -Wno-unused-parameter -Wno-unused-function
+CPPFLAGS += -I$(TLDK_OUTPUT)/include
+
+LDFLAGS += -L$(TLDK_OUTPUT)/lib
+LDLIBS += -ltle_l4p -ltle_timer
 
 # workaround for a gcc bug with noreturn attribute
 # http://gcc.gnu.org/bugzilla/show_bug.cgi?id=12603

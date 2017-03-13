@@ -14,12 +14,15 @@
 #include <rte_icmp.h>
 #include <rte_ip.h>
 #include <rte_udp.h>
+#include <rte_tcp.h>
 #include <rte_ethdev.h>
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_timer.h>
 #include <rte_hexdump.h>
+#include <rte_errno.h>
+#include <tle_tcp.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -52,6 +55,10 @@
 
 #define DEBUG 0
 
+#define MAX_STREAMS 0x10
+#define MAX_STREAM_RBUFS 0x100
+#define MAX_STREAM_SBUFS 0x100
+
 enum op_modes {
 	MODE_NONE = 0,
 	MODE_UDP,
@@ -75,6 +82,7 @@ struct port_device {
     struct port_addr addr;
     struct rte_eth_conf eth_conf;
     struct rte_eth_dev_info dev_info;
+    struct tle_dev *tle_dev;
 };
 
 enum data_ops_e {
@@ -142,6 +150,7 @@ struct udp_ping_data {
 }
 #endif
 
+static struct tle_ctx *tle_ctx;
 static struct port_device local_ports[MAX_LOCAL_PORTS] = {
     { .eth_conf = RX_DEFAULT_ETH_CONF },
     { .eth_conf = RX_DEFAULT_ETH_CONF },
@@ -311,6 +320,13 @@ static void dump_ip_data(const struct rte_mbuf *mbuf,
                     data->seq, data->op, str_op); 
         }
         break;
+
+        case IPPROTO_TCP: {
+            const struct tcp_hdr *tcp_hdr = (const struct tcp_hdr *)(ip + 1);
+	    printf("TCP[p: %d>%d S:%x A:%x flags: %x] ", ntohs(tcp_hdr->src_port), ntohs(tcp_hdr->dst_port), ntohl(tcp_hdr->sent_seq),
+			    ntohl(tcp_hdr->recv_ack), tcp_hdr->tcp_flags);
+        }
+        break;
     }
 }
 
@@ -379,20 +395,20 @@ static int do_icmp_request(int port_id, struct rte_mbuf *mbuf)
     return (ret == 1) ? 0 : 1; 
 }
 
-static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf)
+static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf, struct rte_mbuf *tcp_mbufs[], unsigned int *num_tcp_packets)
 {
     int free_mbuf = 1;
     struct ipv4_hdr *ip = rte_pktmbuf_mtod(mbuf, struct ipv4_hdr *);
     struct peer *peer = find_peer_by_ip(ip->src_addr);
-    if (!peer) {
-        if (!no_dump) printf("cannot find peer for incoming IP\n"); 
-        goto f1;
-    }
 
     mbuf->data_off += sizeof(struct ipv4_hdr);
     switch (ip->next_proto_id) {
         case IPPROTO_UDP: {
-            struct udp_hdr *udp = (struct udp_hdr *)(ip + 1);
+		if (!peer) {
+			if (!no_dump) printf("cannot find peer for incoming IP\n"); 
+			goto f1;
+		}
+		struct udp_hdr *udp = (struct udp_hdr *)(ip + 1);
                 struct udp_ping_data *data = (struct udp_ping_data *)(udp + 1);
                 if (data->op == OP_REQUEST) {
                     rte_pktmbuf_reset(mbuf);
@@ -435,6 +451,10 @@ static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf)
             }
         }
         break;
+        case IPPROTO_TCP:
+	    tcp_mbufs[(*num_tcp_packets)++] = mbuf;
+	    free_mbuf=0;
+	    break;
     }
 
 f1:
@@ -561,7 +581,7 @@ f1:
     return free_mbuf;
 }
 
-static void process_rx(int port_id, struct rte_mbuf *mbuf)
+static void process_rx(int port_id, struct rte_mbuf *mbuf, struct rte_mbuf *tcp_mbufs[], unsigned int *num_tcp_packets)
 {
     int free_mbuf = 1;
     if (DEBUG) printf("DEBUG: process incoming mbuf %p\n", mbuf);
@@ -572,7 +592,7 @@ static void process_rx(int port_id, struct rte_mbuf *mbuf)
             free_mbuf = process_incoming_arp(port_id, mbuf);
             break;
         case ETHER_TYPE_IPv4:
-            free_mbuf = process_incoming_ip(port_id, mbuf);
+            free_mbuf = process_incoming_ip(port_id, mbuf, tcp_mbufs, num_tcp_packets);
             break;
         default: {
 #if 0
@@ -998,6 +1018,23 @@ static void tx_timer_callback(struct rte_timer *rte_tm, void *tm_arg)
     send_weka_probe();
 }
 
+static void tcp_send_buffers(int port)
+{
+    struct rte_mbuf *bufs[BURST_SIZE];
+    uint16_t num_packets = tle_tcp_tx_bulk(local_ports[port].tle_dev, bufs, BURST_SIZE);
+    
+    if( num_packets==0 )
+	return;
+
+    printf("TLDK asked to send %d packets\n", num_packets);
+
+    uint16_t num_sent = rte_eth_tx_burst(port, 0, bufs, num_packets);
+    while( num_sent<num_packets ) {
+        rte_pktmbuf_free(bufs[num_sent]);
+	num_sent++;
+    }
+}
+
 static __attribute__((noreturn)) void
 lcore_main(void)
 {
@@ -1019,16 +1056,39 @@ lcore_main(void)
 
     while (1) {
 
+	// Receive
         for (p = 0; p < nb_ports; p++) {
+	    struct rte_mbuf *tcp_packets[BURST_SIZE];
+	    unsigned int num_tcp_packets = 0;
+
             uint16_t nb_rx = rte_eth_rx_burst(p, 0, bufs, BURST_SIZE);
             if (DEBUG) fprintf(stdout, "RX[%d]: Got %u packets (%lu)\n", p, nb_rx, count++);
 
             for (i = 0; i < nb_rx; i++) {
                 dump_packet(p, bufs[i], "IN");
-                process_rx(p, bufs[i]);
+                process_rx(p, bufs[i], tcp_packets, &num_tcp_packets);
             }
+
+	    // Pass the received mbufs to TCP
+	    if( num_tcp_packets>0 ) {
+		struct rte_mbuf *unprocessed_packets[BURST_SIZE];
+		int32_t rc[BURST_SIZE];
+		uint16_t num_processed = tle_tcp_rx_bulk(local_ports[p].tle_dev, tcp_packets, unprocessed_packets, rc, num_tcp_packets);
+		uint16_t sad_discarded_packets;
+		for( sad_discarded_packets=0; sad_discarded_packets < num_tcp_packets-num_processed; ++sad_discarded_packets ) {
+		    rte_pktmbuf_free(unprocessed_packets[sad_discarded_packets]);
+		}
+	    }
         }
-        
+
+	// TCP periodic processing
+	tle_tcp_process(tle_ctx, MAX_STREAMS);
+
+	// TCP outgoing buffers
+        for (p = 0; p < nb_ports; p++) {
+	    tcp_send_buffers(p);
+	}
+
         rte_timer_manage();
 
     }
@@ -1089,17 +1149,18 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 		return -1;
 
 	/* Configure the Ethernet device. */
-	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &local_ports[port].eth_conf);
+	struct port_device *local_port = &local_ports[port];
+	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &local_port->eth_conf);
 	if (retval != 0)
 		return retval;
 
-    /* register lsi interrupt callback, need to be after
-     * rte_eth_dev_configure(). if (intr_conf.lsc == 0), no
-     * lsc interrupt will be present, and below callback to
-     * be registered will never be called.
-     */
-    rte_eth_dev_callback_register(port,
-        RTE_ETH_EVENT_INTR_LSC, lsi_event_callback, NULL);
+	/* register lsi interrupt callback, need to be after
+	 * rte_eth_dev_configure(). if (intr_conf.lsc == 0), no
+	 * lsc interrupt will be present, and below callback to
+	 * be registered will never be called.
+	 */
+	rte_eth_dev_callback_register(port,
+			RTE_ETH_EVENT_INTR_LSC, lsi_event_callback, NULL);
 
 
 	/* Allocate and set up 1 RX queue per Ethernet port. */
@@ -1107,16 +1168,16 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 		retval = rte_eth_rx_queue_setup(port, q, RX_RING_SIZE,
 				rte_eth_dev_socket_id(port), &rx_conf, mbuf_pool);
 
-        if (retval < 0) {
-            printf("port %d - failed to allocate RX queue %d on socket %d (%d)\n",
-                   port, q, rte_eth_dev_socket_id(port), retval);
-            retval = rte_eth_rx_queue_setup(port, q, RX_RING_SIZE, SOCKET_ID_ANY, &rx_conf, mbuf_pool);
-            if (retval < 0) {
-                printf("port %d - failed to allocate RX queue %d on socket %d (%d)\n",
-                   port, q, SOCKET_ID_ANY, retval);
-                return retval;
-            }
-        }
+		if (retval < 0) {
+			printf("port %d - failed to allocate RX queue %d on socket %d (%d)\n",
+					port, q, rte_eth_dev_socket_id(port), retval);
+			retval = rte_eth_rx_queue_setup(port, q, RX_RING_SIZE, SOCKET_ID_ANY, &rx_conf, mbuf_pool);
+			if (retval < 0) {
+				printf("port %d - failed to allocate RX queue %d on socket %d (%d)\n",
+						port, q, SOCKET_ID_ANY, retval);
+				return retval;
+			}
+		}
 	}
 
 	/* Allocate and set up 1 TX queue per Ethernet port. */
@@ -1124,21 +1185,21 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 		retval = rte_eth_tx_queue_setup(port, q, TX_RING_SIZE,
 				rte_eth_dev_socket_id(port), &tx_conf);
 		if (retval < 0) {
-            printf("port %d - failed to allocate TX queue %d on socket %d\n",
-                   port, q, rte_eth_dev_socket_id(port));
-            retval = rte_eth_tx_queue_setup(port, q, TX_RING_SIZE, SOCKET_ID_ANY, NULL);
+			printf("port %d - failed to allocate TX queue %d on socket %d\n",
+					port, q, rte_eth_dev_socket_id(port));
+			retval = rte_eth_tx_queue_setup(port, q, TX_RING_SIZE, SOCKET_ID_ANY, NULL);
 			if (retval < 0) return retval;
-        }
+		}
 	}
 
-#if 1
+#if 0
 	uint16_t mtu=4190;
-    retval = rte_eth_dev_set_mtu(port, mtu);
-    if (retval < 0) {
-        printf("Couldnt set MTU %d on port %d\n", port, mtu);
-    } else {
-        printf("Set MTU for port %d to %d\n", port, mtu);
-    }
+	retval = rte_eth_dev_set_mtu(port, mtu);
+	if (retval < 0) {
+		printf("Couldnt set MTU %d on port %d\n", port, mtu);
+	} else {
+		printf("Set MTU for port %d to %d\n", port, mtu);
+	}
 #endif
 
 	/* Start the Ethernet port. */
@@ -1147,32 +1208,33 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 		return retval;
 
 	/* Display the port MAC address. */
-    struct ether_addr *mac = &local_ports[port].addr.ethernet;
+	struct ether_addr *mac = &local_port->addr.ethernet;
 	rte_eth_macaddr_get(port, mac);
-    rte_eth_dev_info_get(port, &local_ports[port].dev_info);
+	rte_eth_dev_info_get(port, &local_port->dev_info);
 	fprintf(stdout, "Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
-			   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " ",
+			" %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " ",
 			(unsigned)port,
 			mac->addr_bytes[0], mac->addr_bytes[1],
 			mac->addr_bytes[2], mac->addr_bytes[3],
 			mac->addr_bytes[4], mac->addr_bytes[5]);
 
-    fprintf(stdout, "IPv4 TX offload: %s ", local_ports[port].dev_info.tx_offload_capa & DEV_TX_OFFLOAD_IPV4_CKSUM ? "yes" : "no");
-    fprintf(stdout, "UDP  TX offload: %s ", local_ports[port].dev_info.tx_offload_capa & DEV_TX_OFFLOAD_UDP_CKSUM ? "yes" : "no");
-    fprintf(stdout, "promiscuous: %s ", rte_eth_promiscuous_get(port) ? "on" : "off");
-    fprintf(stdout, "ethernet multicast: %s ", rte_eth_allmulticast_get(port) ? "on" : "off");
+	fprintf(stdout, "IPv4 TX offload: %s ", local_ports[port].dev_info.tx_offload_capa & DEV_TX_OFFLOAD_IPV4_CKSUM ? "yes" : "no");
+	fprintf(stdout, "UDP  TX offload: %s ", local_ports[port].dev_info.tx_offload_capa & DEV_TX_OFFLOAD_UDP_CKSUM ? "yes" : "no");
+	fprintf(stdout, "TCP  TX offload: %s ", local_ports[port].dev_info.tx_offload_capa & DEV_TX_OFFLOAD_TCP_CKSUM ? "yes" : "no");
+	fprintf(stdout, "promiscuous: %s ", rte_eth_promiscuous_get(port) ? "on" : "off");
+	fprintf(stdout, "ethernet multicast: %s ", rte_eth_allmulticast_get(port) ? "on" : "off");
 
-    fprintf(stdout, "\n");
+	fprintf(stdout, "\n");
 
-    if (0) {
-        /* Enable RX in promiscuous mode for the Ethernet device. */
-        rte_eth_promiscuous_enable(port);
-    }
+	if (0) {
+		/* Enable RX in promiscuous mode for the Ethernet device. */
+		rte_eth_promiscuous_enable(port);
+	}
 
-    if (1) {
-        fprintf(stdout, "=== enable ethernet multicast\n");
-        rte_eth_allmulticast_enable(port);
-    }
+	if (1) {
+		fprintf(stdout, "=== enable ethernet multicast\n");
+		rte_eth_allmulticast_enable(port);
+	}
 
 	return 0;
 }
@@ -1221,6 +1283,43 @@ static int dpdk_init(int argc, char **argv)
     }
 
     return argn;
+}
+
+static int tldk_init(void)
+{
+    struct tle_ctx_param ctx_param;
+    memset( &ctx_param, 0, sizeof(ctx_param) );
+    ctx_param.socket_id = rte_socket_id();
+    ctx_param.proto = TLE_PROTO_TCP;
+    ctx_param.max_streams = MAX_STREAMS;
+    ctx_param.max_stream_rbufs = MAX_STREAM_RBUFS;
+    ctx_param.max_stream_sbufs = MAX_STREAM_SBUFS;
+    struct tle_ctx *ctx = tle_ctx_create(&ctx_param);
+    if( ctx==NULL ) {
+        fprintf(stderr, "tle_ctx_create failed: %d\n", rte_errno);
+        return -rte_errno;
+    }
+    tle_ctx = ctx;
+
+    int port;
+    for (port = 0; port < nb_ports; port++) {
+        // tcp_stream_setup();
+        struct tle_dev_param dev_prm;
+        memset( &dev_prm, 0, sizeof(dev_prm) );
+        struct port_device *local_port = &local_ports[port];
+        dev_prm.rx_offload = local_port->dev_info.rx_offload_capa & (DEV_RX_OFFLOAD_TCP_CKSUM | DEV_RX_OFFLOAD_IPV4_CKSUM);
+        dev_prm.tx_offload = local_port->dev_info.tx_offload_capa & (DEV_TX_OFFLOAD_TCP_CKSUM | DEV_TX_OFFLOAD_IPV4_CKSUM);
+        dev_prm.local_addr4 = local_port->addr.ip;
+
+        fprintf(stderr, "ip: %x\n", dev_prm.local_addr4.s_addr );
+        local_port->tle_dev = tle_add_dev( tle_ctx, &dev_prm );
+        if( local_port->tle_dev==NULL ) {
+            fprintf(stderr, "Failed to add TLE device on port %d: %d\n", port, rte_errno);
+            return -rte_errno;
+        }
+    }
+
+    return 0;
 }
 
 static struct peer *find_peer_by_ip(uint32_t ip)
@@ -1531,12 +1630,22 @@ int main(int argc, char **argv)
 
 	int ret;
 	ret = dpdk_init(argc, argv);
+	if( ret<0 ) {
+	    fprintf(stderr, "DPDK init failed: %d\n", -ret);
+	    return 1;
+	}
 
 	argc -= ret;
 	argv += ret;
 	proc_init(argc, argv);
 
-    __dbg_check_mbuf();
+        ret = tldk_init();
+        if( ret<0 ) {
+            fprintf(stderr, "TLDK init failed: %d\n", -ret);
+            return 1;
+        }
+
+	__dbg_check_mbuf();
 
 	lcore_main();
 }

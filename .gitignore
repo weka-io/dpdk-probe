@@ -31,3 +31,10 @@
 # Debug files
 *.dSYM/
 *.su
+
+# Output dir
+build
+
+# Development helpers
+.*.swp
+tags
