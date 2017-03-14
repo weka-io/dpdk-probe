@@ -156,6 +156,7 @@ static int nb_peers = 0;
 static struct rte_mempool *mbuf_pool = NULL;
 static struct rte_timer tx_timer;
 
+static int      mbuf_chain = 0;
 static int      udp_jam = 0;
 static int      no_dump = 0;
 static int      no_dump_arp = 1;
@@ -259,7 +260,10 @@ static void dump_ip_data(const struct rte_mbuf *mbuf,
 
     switch (ip->next_proto_id) {
         case IPPROTO_ICMP: {
-            const struct icmp_hdr *icmp = (const struct icmp_hdr *)(ip + 1);
+            const struct icmp_hdr *icmp = mbuf_chain && mbuf->next ?
+                                    (const struct icmp_hdr *)rte_pktmbuf_mtod(mbuf->next, void *) : 
+                                    (const struct icmp_hdr *)(ip + 1);
+
             fprintf(stdout, "ICMP[%s seq %u] ",
                     icmp->icmp_type == IP_ICMP_ECHO_REQUEST ? "REQUEST" : "REPLY",
                     __bswap_16(icmp->icmp_seq_nb));
@@ -269,7 +273,10 @@ static void dump_ip_data(const struct rte_mbuf *mbuf,
 
         case IPPROTO_UDP: {
             const struct udp_hdr *udp = (const struct udp_hdr*)(ip + 1);
-            const struct udp_ping_data *data = (const struct udp_ping_data *)(udp + 1);
+            const struct udp_ping_data *data = mbuf_chain && mbuf->next ?
+                                                (const struct udp_ping_data *)rte_pktmbuf_mtod(mbuf->next, struct udp_ping_data *) : 
+                                                (const struct udp_ping_data *)(udp + 1);
+
             char str_op[16];
             switch (data->op) {
                 case OP_REQUEST:
@@ -312,6 +319,8 @@ static void dump_packet(int port_id, const struct rte_mbuf *mbuf, const char *ta
     if (no_dump) {
         return;
     }
+
+    //rte_pktmbuf_dump(stdout, mbuf, mbuf->pkt_len);
 
     const uint8_t *rx_data = (const uint8_t *)rte_ctrlmbuf_data(mbuf);
     const struct ether_hdr *ethernet = (const struct ether_hdr *)rx_data; 
@@ -652,11 +661,30 @@ static void pkt_assemble_icmp_request(struct rte_mbuf **mbuf, struct peer *peer,
 {
 	(void)op;
 	int i; for (i = 0; i < burst; i++) {
-		mbuf[i]->data_len = mbuf[i]->pkt_len = frame_size;
-
 		struct ether_hdr *eth = rte_pktmbuf_mtod(mbuf[i], struct ether_hdr *);
 		struct ipv4_hdr *ip     = (struct ipv4_hdr *)(eth + 1);
-		struct icmp_hdr *icmp   = (struct icmp_hdr *)(ip + 1);
+        struct icmp_hdr *icmp;
+
+        if (!mbuf_chain) {
+            rte_pktmbuf_pkt_len(mbuf[i])  = 
+            rte_pktmbuf_data_len(mbuf[i]) = frame_size;
+
+		    icmp   = (struct icmp_hdr *)(ip + 1);
+        } else {
+            struct rte_mbuf *chain = rte_pktmbuf_alloc(mbuf_pool);
+            if (!chain) {
+                rte_exit(EXIT_FAILURE, "cannot allocate chain MBUF\n");
+            }
+            mbuf[i]->nb_segs++;
+            mbuf[i]->next = chain;
+            chain->data_off = 0;
+            rte_pktmbuf_pkt_len(mbuf[i]) = frame_size;
+            rte_pktmbuf_data_len(mbuf[i]) = sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr);
+            rte_pktmbuf_pkt_len(chain) = 
+            rte_pktmbuf_data_len(chain) = frame_size - rte_pktmbuf_data_len(mbuf[i]);
+            icmp = rte_pktmbuf_mtod(chain, void *);
+        }
+
 		void *data = (icmp + 1);
 
 		ethernet_header(eth, peer, ETHER_TYPE_IPv4);
@@ -686,13 +714,34 @@ static void pkt_assemble_udp(struct rte_mbuf **mbuf, struct peer *peer, enum dat
 
     int i;
     for (i = 0; i < burst; i++) {
-        mbuf[i]->data_len = mbuf[i]->pkt_len = frame_size; 
-
         struct ether_hdr *eth = rte_pktmbuf_mtod(mbuf[i], struct ether_hdr *);
         struct ipv4_hdr *ip     = (struct ipv4_hdr *)(eth + 1);
         struct udp_hdr *udp   = (struct udp_hdr *)(ip + 1);
-        struct udp_ping_data *uping = (struct udp_ping_data *)(udp + 1);
+        struct udp_ping_data *uping = NULL;
 
+        if (mbuf_chain && op == OP_REQUEST) {
+            struct rte_mbuf *chain = rte_pktmbuf_alloc(mbuf_pool);
+            if (!chain) {
+                rte_exit(EXIT_FAILURE, "cannot allocate chain MBUF\n");
+            }
+            mbuf[i]->nb_segs++;
+            mbuf[i]->next = chain;
+            chain->data_off = 0;
+            rte_pktmbuf_pkt_len(mbuf[i]) = frame_size;
+            rte_pktmbuf_data_len(mbuf[i]) = sizeof(struct ether_hdr) + 
+                                            sizeof(struct ipv4_hdr)  +
+                                            sizeof(struct udp_hdr);
+            rte_pktmbuf_pkt_len(chain) =
+            rte_pktmbuf_data_len(chain) = frame_size - 
+                                          rte_pktmbuf_data_len(mbuf[i]);
+
+            uping = rte_pktmbuf_mtod(chain, struct udp_ping_data *);
+        } else {
+            rte_pktmbuf_pkt_len(mbuf[i]) = 
+            rte_pktmbuf_data_len(mbuf[i]) = frame_size;
+            uping = (struct udp_ping_data *)(udp + 1);
+        }
+        
         ethernet_header(eth, peer, ETHER_TYPE_IPv4);
         size_t data_size = mbuf[i]->pkt_len - sizeof(struct ether_hdr);
         ipv4_header(ip, peer, data_size, IPPROTO_UDP);
@@ -1284,6 +1333,7 @@ enum long_opt_e {
 	OPT_ROCE_DEV,
 	OPT_ROCE_GUID,
 	OPT_IB_MODE,
+    OPT_MBUF_CHAIN,
 	OPT_UDP_JAM,
 	OPT_NO_DUMP,
 	OPT_DUMP_ARP,
@@ -1301,6 +1351,7 @@ static const struct option proc_long_opt[] = {
 	{ "roce-dev",   required_argument,  0, OPT_ROCE_DEV },
 	{ "roce-guid",  required_argument,  0, OPT_ROCE_GUID },
 	{ "ib-mode",  required_argument,    0, OPT_IB_MODE },
+    { "chain",      no_argument,        0, OPT_MBUF_CHAIN},
 	{ "udp-jam",    no_argument,        0, OPT_UDP_JAM },
 	{ "no-dump",    no_argument,        0, OPT_NO_DUMP },
 	{ "dump-arp",   no_argument,        0, OPT_DUMP_ARP },
@@ -1396,6 +1447,8 @@ static void parse_arguments(int argc, char **argv)
 			case OPT_NO_DUMP: no_dump = 1; break;
 
 			case OPT_DUMP_ARP: no_dump_arp = 0; break;
+
+            case OPT_MBUF_CHAIN: mbuf_chain = 1; break;
 
 			case -1: return;
 			default: rte_exit(EXIT_FAILURE, "Error: unknown parameter %s", optarg);
