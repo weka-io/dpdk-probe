@@ -100,10 +100,12 @@ struct peer {
 struct udp_ping_data {
     uint64_t seq;
     enum data_ops_e op;
+    uint16_t counter_csum; 
     union {
         uint8_t   uint8_data[0];
         uint64_t  uint64_data[0];
     };
+    uint8_t __unused__[34];
 } __attribute__((__packed__));
 
 #if 1
@@ -645,6 +647,7 @@ static void format_udp_ping(struct udp_ping_data *data, struct peer *peer,
 {
     data->seq = peer->sequence++;
     data->op = op;
+    data->counter_csum = 0;
     if (verify_payload && (op == OP_REQUEST)) {
         int i;
         for (i = 0; i < size - 64; i++) data->uint8_data[i] = (uint8_t)i;
@@ -760,6 +763,7 @@ static void pkt_assemble_udp(struct rte_mbuf **mbuf, struct peer *peer, enum dat
 #endif
         ip->hdr_checksum = 0;
         udp->dgram_cksum = 0;
+        uping->counter_csum = rte_ipv4_udptcp_cksum(ip, udp);
         udp->dgram_cksum = rte_ipv4_phdr_cksum(ip, mbuf[i]->ol_flags);
 
         if (udp_jam && ((jam_cnt++ & UDP_JAM_MASK) == UDP_JAM_MASK)) {
