@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdint.h>
 #include <signal.h>
@@ -29,7 +27,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
+#include <netinet/ip.h>
 #include <arpa/inet.h>
 
 #include <getopt.h>
@@ -58,6 +56,12 @@
 #define MAX_STREAMS 0x10
 #define MAX_STREAM_RBUFS 0x100
 #define MAX_STREAM_SBUFS 0x100
+#define TCP_RETRIES 4
+
+// Echo server port
+#define LISTENING_PORT 7
+
+#define ETH_MTU 1500
 
 enum op_modes {
 	MODE_NONE = 0,
@@ -355,7 +359,8 @@ static void dump_packet(int port_id, const struct rte_mbuf *mbuf, const char *ta
 
         case ETHER_TYPE_IPv4: {
             const struct ipv4_hdr *ip = (const struct ipv4_hdr *)(ethernet + 1);
-            fprintf(stdout, "%s[%d] ", tag, port_id);
+	    if( ip->next_proto_id == IPPROTO_UDP )
+		break; // Skip printing UDP packets
             dump_ethernet_data(ethernet);
             dump_ip_data(mbuf, ip, tag);
             fprintf(stdout, "\n");
@@ -401,11 +406,11 @@ static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf, struct
     struct ipv4_hdr *ip = rte_pktmbuf_mtod(mbuf, struct ipv4_hdr *);
     struct peer *peer = find_peer_by_ip(ip->src_addr);
 
-    mbuf->data_off += sizeof(struct ipv4_hdr);
     switch (ip->next_proto_id) {
         case IPPROTO_UDP: {
+                              mbuf->data_off += sizeof(struct ipv4_hdr);
 		if (!peer) {
-			if (!no_dump) printf("cannot find peer for incoming IP\n"); 
+			// if (!no_dump) printf("cannot find peer for incoming IP\n"); 
 			goto f1;
 		}
 		struct udp_hdr *udp = (struct udp_hdr *)(ip + 1);
@@ -437,6 +442,7 @@ static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf, struct
         break;
 
         case IPPROTO_ICMP: {
+            mbuf->data_off += sizeof(struct ipv4_hdr);
             struct icmp_hdr *icmp = (struct icmp_hdr *)(ip + 1);
             switch (icmp->icmp_type) {
             	case IP_ICMP_ECHO_REQUEST: {
@@ -451,8 +457,26 @@ static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf, struct
             }
         }
         break;
+
         case IPPROTO_TCP:
+            mbuf->data_off -= sizeof(struct ether_hdr);
 	    tcp_mbufs[(*num_tcp_packets)++] = mbuf;
+            if( mbuf->packet_type==0 ) {
+                fprintf(stderr, "TCP packet has no packet type set\n");
+                // XXX Horrid hack - should, instead, find out why this isn't set correctly (on e1000?)
+                mbuf->packet_type = RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_TCP;
+            }
+            if( mbuf->tx_offload==0 ) {
+                const uint8_t *rx_data = (const uint8_t *)rte_ctrlmbuf_data(mbuf);
+                fprintf(stderr, "TCP packet has no header lengths set\n");
+                const struct ether_hdr *ethernet = (const struct ether_hdr *)rx_data;
+                mbuf->l2_len = sizeof(struct ether_hdr);
+                const struct ipv4_hdr *ip = (const struct ipv4_hdr *)(ethernet + 1);
+                mbuf->l3_len = (ip->version_ihl & 0xf) << 2;
+                const struct tcp_hdr *tcp = (const struct tcp_hdr *)(((const uint8_t *)ip)+mbuf->l3_len);
+                mbuf->l4_len = (tcp->data_off >> 4) * 4;
+            }
+
 	    free_mbuf=0;
 	    break;
     }
@@ -1027,12 +1051,8 @@ static void tcp_send_buffers(int port)
 	return;
 
     printf("TLDK asked to send %d packets\n", num_packets);
-
-    uint16_t num_sent = rte_eth_tx_burst(port, 0, bufs, num_packets);
-    while( num_sent<num_packets ) {
-        rte_pktmbuf_free(bufs[num_sent]);
-	num_sent++;
-    }
+    send_packets(bufs, num_packets);
+    printf("TLDK sent\n");
 }
 
 static __attribute__((noreturn)) void
@@ -1076,6 +1096,7 @@ lcore_main(void)
 		uint16_t num_processed = tle_tcp_rx_bulk(local_ports[p].tle_dev, tcp_packets, unprocessed_packets, rc, num_tcp_packets);
 		uint16_t sad_discarded_packets;
 		for( sad_discarded_packets=0; sad_discarded_packets < num_tcp_packets-num_processed; ++sad_discarded_packets ) {
+                    fprintf(stderr, "Dropped incoming packet: %s\n", strerror(rc[sad_discarded_packets]));
 		    rte_pktmbuf_free(unprocessed_packets[sad_discarded_packets]);
 		}
 	    }
@@ -1192,8 +1213,8 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 		}
 	}
 
-#if 0
-	uint16_t mtu=4190;
+#if 1
+	uint16_t mtu=ETH_MTU;
 	retval = rte_eth_dev_set_mtu(port, mtu);
 	if (retval < 0) {
 		printf("Couldnt set MTU %d on port %d\n", port, mtu);
@@ -1285,8 +1306,25 @@ static int dpdk_init(int argc, char **argv)
     return argn;
 }
 
+static void new_tcp_session(void *opaq, struct tle_stream *new_stream)
+{
+    printf("New connection\n");
+}
+
+static struct tle_stream *tcp_listen_stream;
+
+static struct tle_dest one_and_only_tle_dest;
+static int tcp_lookup_cb(void *opaque, const struct in_addr *addr, struct tle_dest *res)
+{
+    *res = one_and_only_tle_dest;
+
+    return 0;
+}
+
 static int tldk_init(void)
 {
+    printf("Initializing TLDK\n");
+
     struct tle_ctx_param ctx_param;
     memset( &ctx_param, 0, sizeof(ctx_param) );
     ctx_param.socket_id = rte_socket_id();
@@ -1294,6 +1332,7 @@ static int tldk_init(void)
     ctx_param.max_streams = MAX_STREAMS;
     ctx_param.max_stream_rbufs = MAX_STREAM_RBUFS;
     ctx_param.max_stream_sbufs = MAX_STREAM_SBUFS;
+    ctx_param.lookup4 = tcp_lookup_cb;
     struct tle_ctx *ctx = tle_ctx_create(&ctx_param);
     if( ctx==NULL ) {
         fprintf(stderr, "tle_ctx_create failed: %d\n", rte_errno);
@@ -1311,12 +1350,45 @@ static int tldk_init(void)
         dev_prm.tx_offload = local_port->dev_info.tx_offload_capa & (DEV_TX_OFFLOAD_TCP_CKSUM | DEV_TX_OFFLOAD_IPV4_CKSUM);
         dev_prm.local_addr4 = local_port->addr.ip;
 
-        fprintf(stderr, "ip: %x\n", dev_prm.local_addr4.s_addr );
         local_port->tle_dev = tle_add_dev( tle_ctx, &dev_prm );
         if( local_port->tle_dev==NULL ) {
             fprintf(stderr, "Failed to add TLE device on port %d: %d\n", port, rte_errno);
             return -rte_errno;
         }
+    }
+
+    one_and_only_tle_dest.head_mp = mbuf_pool;
+    one_and_only_tle_dest.dev = local_ports[0].tle_dev;
+    one_and_only_tle_dest.mtu = ETH_MTU;
+    one_and_only_tle_dest.l2_len = sizeof(struct ether_hdr);
+
+    // Create a listening port
+    struct tle_tcp_stream_param params;
+    memset( &params, 0, sizeof(params) );
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = local_ports[0].addr.ip.s_addr;
+    addr.sin_port = htons(LISTENING_PORT);
+
+    memcpy( &params.addr.local, &addr, sizeof(addr) );
+
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(0);
+    memcpy( &params.addr.remote, &addr, sizeof(addr) );
+
+    params.cfg.nb_retries = TCP_RETRIES;
+    params.cfg.recv_cb.func = new_tcp_session;
+
+    tcp_listen_stream = tle_tcp_stream_open(tle_ctx, &params);
+    if( tcp_listen_stream==NULL ) {
+	fprintf( stderr, "TCP listening stream creation failure: %d\n", rte_errno );
+        rte_exit(EXIT_FAILURE, "Error: cannot create listening TCP stream\n");
+    }
+
+    int res = tle_tcp_stream_listen(tcp_listen_stream);
+    if( res!=0 ) {
+	rte_exit(EXIT_FAILURE, "Error: Failed to set listen mode on socket: %d\n", rte_errno);
     }
 
     return 0;
