@@ -45,6 +45,7 @@
 #define MAX_LOCAL_PORTS 4
 #define MAX_PEERS 128
 #define MAX_FRAME_SIZE ((MBUF_SIZE) - 512)
+#define MAX_ARP_ENTRIES 4
 #define DEFAULT_UDP_FRAME_SIZE 128
 #define DEFAULT_UPD_PORT 3103
 #define MAX_ROCE_ARGS 32
@@ -109,6 +110,11 @@ struct peer {
     uint32_t resolve_count;
 };
 
+struct arp_entry {
+	struct in_addr ip_addr;
+	struct ether_addr eth_addr;
+};
+
 struct udp_ping_data {
     uint64_t seq;
     enum data_ops_e op;
@@ -163,6 +169,8 @@ static struct port_device local_ports[MAX_LOCAL_PORTS] = {
 };
 
 static struct peer peers[MAX_PEERS];
+static struct arp_entry arp_entries[MAX_ARP_ENTRIES];
+static unsigned int nb_arp_entries;
 
 static int nb_ports = 0;
 static int nb_peers = 0;
@@ -216,6 +224,16 @@ static const struct  {
 	{ "icmp", pkt_assemble_icmp_request, MODE_ICMP},
 	{ "roce", NULL, MODE_ROCE}
 };
+
+// Returns number of bytes to advance in string
+static int parse_ehter_addr(const char *address, uint8_t parsed[]) {
+	int num_consumed;
+	if( sscanf(address, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx%n", parsed, parsed+1, parsed+2, parsed+3, parsed+4, parsed+5, &num_consumed)!=6 ) {
+		rte_exit(EXIT_FAILURE, "Malformatted MAC address %s\n", address);
+	}
+
+	return num_consumed;
+}
 
 static void show_time(const char *msg)
 {
@@ -1048,11 +1066,9 @@ static void tcp_send_buffers(int port)
     uint16_t num_packets = tle_tcp_tx_bulk(local_ports[port].tle_dev, bufs, BURST_SIZE);
     
     if( num_packets==0 )
-	return;
+		return;
 
-    printf("TLDK asked to send %d packets\n", num_packets);
     send_packets(bufs, num_packets);
-    printf("TLDK sent\n");
 }
 
 static __attribute__((noreturn)) void
@@ -1317,8 +1333,20 @@ static struct tle_dest one_and_only_tle_dest;
 static int tcp_lookup_cb(void *opaque, const struct in_addr *addr, struct tle_dest *res)
 {
     *res = one_and_only_tle_dest;
+    struct ether_hdr *eth = (struct ether_hdr *)&res->hdr;
+    eth->s_addr = local_ports[0].addr.ethernet;
+    eth->ether_type = htons(ETHER_TYPE_IPv4);
 
-    return 0;
+    unsigned int i;
+    for( i=0; i<nb_arp_entries; ++i ) {
+		if( arp_entries[i].ip_addr.s_addr == addr->s_addr ) {
+			eth->d_addr = arp_entries[i].eth_addr;
+
+			return 0;
+		}
+	}
+
+    return -EHOSTUNREACH;
 }
 
 static int tldk_init(void)
@@ -1357,10 +1385,18 @@ static int tldk_init(void)
         }
     }
 
-    one_and_only_tle_dest.head_mp = mbuf_pool;
-    one_and_only_tle_dest.dev = local_ports[0].tle_dev;
-    one_and_only_tle_dest.mtu = ETH_MTU;
-    one_and_only_tle_dest.l2_len = sizeof(struct ether_hdr);
+	{
+		one_and_only_tle_dest.head_mp = mbuf_pool;
+		one_and_only_tle_dest.dev = local_ports[0].tle_dev;
+		one_and_only_tle_dest.mtu = ETH_MTU;
+		one_and_only_tle_dest.l2_len = sizeof(struct ether_hdr);
+		one_and_only_tle_dest.l3_len = sizeof(struct ipv4_hdr);
+
+		struct ipv4_hdr *ip = (struct ipv4_hdr *)(one_and_only_tle_dest.hdr + one_and_only_tle_dest.l2_len);
+		ip->version_ihl = 0x45; // Because I'm lazy
+		ip->time_to_live = 64;
+		ip->next_proto_id = IPPROTO_TCP;
+	}
 
     // Create a listening port
     struct tle_tcp_stream_param params;
@@ -1504,10 +1540,11 @@ enum long_opt_e {
 	OPT_ROCE_DEV,
 	OPT_ROCE_GUID,
 	OPT_IB_MODE,
-    OPT_MBUF_CHAIN,
+	OPT_MBUF_CHAIN,
 	OPT_UDP_JAM,
 	OPT_NO_DUMP,
 	OPT_DUMP_ARP,
+	OPT_STATIC_ARP,
 };
 
 static const struct option proc_long_opt[] = {
@@ -1522,10 +1559,11 @@ static const struct option proc_long_opt[] = {
 	{ "roce-dev",   required_argument,  0, OPT_ROCE_DEV },
 	{ "roce-guid",  required_argument,  0, OPT_ROCE_GUID },
 	{ "ib-mode",  required_argument,    0, OPT_IB_MODE },
-    { "chain",      no_argument,        0, OPT_MBUF_CHAIN},
+	{ "chain",      no_argument,        0, OPT_MBUF_CHAIN},
 	{ "udp-jam",    no_argument,        0, OPT_UDP_JAM },
 	{ "no-dump",    no_argument,        0, OPT_NO_DUMP },
 	{ "dump-arp",   no_argument,        0, OPT_DUMP_ARP },
+	{ "static-arp", required_argument,  0, OPT_STATIC_ARP },
 
 	{0, 0, 0, 0}
 };
@@ -1620,6 +1658,21 @@ static void parse_arguments(int argc, char **argv)
 			case OPT_DUMP_ARP: no_dump_arp = 0; break;
 
             case OPT_MBUF_CHAIN: mbuf_chain = 1; break;
+			case OPT_STATIC_ARP:
+				{
+					const char *arg = optarg;
+					// Format: 01:02:03:04:05:06=10.11.12.13
+					if( nb_arp_entries==MAX_ARP_ENTRIES ) {
+						rte_exit(EXIT_FAILURE, "Too many static arp entries in command line");
+					}
+
+					arg += parse_ehter_addr( optarg, arp_entries[nb_arp_entries].eth_addr.addr_bytes );
+					if( *arg != '=' || inet_aton(arg+1, &arp_entries[nb_arp_entries].ip_addr)==0 )
+						rte_exit(EXIT_FAILURE, "Static arp argument %s malformed: Use 01:02:03:ab:05:06=10.11.12.13\n", optarg);
+
+					nb_arp_entries++;
+				}
+				break;
 
 			case -1: return;
 			default: rte_exit(EXIT_FAILURE, "Error: unknown parameter %s", optarg);
