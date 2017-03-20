@@ -1322,9 +1322,75 @@ static int dpdk_init(int argc, char **argv)
     return argn;
 }
 
-static void new_tcp_session(void *opaq, struct tle_stream *new_stream)
+struct tle_stream *connected_streams[MAX_STREAMS];
+
+static void session_read_cb(void *opaq, struct tle_stream *session_stream)
 {
-    printf("New connection\n");
+    struct rte_mbuf *bufs[5];
+    uint16_t num_buffers = tle_tcp_stream_recv(session_stream, bufs, 5);
+    printf("Received %d buffers from %p\n", num_buffers, session_stream);
+
+    printf("Client says: \"");
+    uint16_t bufnum;
+    for( bufnum=0; bufnum<num_buffers; ++bufnum ) {
+        uint16_t i;
+        for( i=bufs[bufnum]->data_off; i<bufs[bufnum]->buf_len; ++i ) {
+            putchar(((const char *)bufs[bufnum]->buf_addr)[i]);
+        }
+    }
+    printf("\"\n");
+
+    uint16_t res = tle_tcp_stream_send(session_stream, bufs, num_buffers);
+    printf("Echoing returned %d\n", res);
+}
+
+static void session_error_cb(void *opaq, struct tle_stream *session_stream)
+{
+    printf("Error ready\n");
+}
+
+static void new_tcp_session(void *opaq, struct tle_stream *listen_stream)
+{
+    //while( 1 ) {
+    do {
+        int res;
+        struct tle_stream *new_stream;
+        res = tle_tcp_stream_accept(listen_stream, &new_stream, 1);
+        if( res==-ENFILE ) {
+            // No more streams to open
+            break;
+        }
+        if( res<0 ) {
+            rte_exit(EXIT_FAILURE, "Failed to accept incoming connection: %s", strerror(-res));
+        }
+
+        printf("new connection: %p\n", new_stream);
+        struct tle_tcp_stream_addr addr_raw;
+        res=tle_tcp_stream_get_addr(new_stream, &addr_raw);
+        if( res!=0 ) {
+            rte_exit(EXIT_FAILURE, "Failed to get addresses from new stream: %s", strerror(-res));
+        }
+        struct sockaddr_in *addr;
+        addr = (struct sockaddr_in *)&addr_raw.local;
+        printf("New connection local %s:%d\n", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
+        addr = (struct sockaddr_in *)&addr_raw.remote;
+        printf("New connection remote %s:%d\n", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
+
+        struct tle_tcp_stream_cfg cfg;
+        memset( &cfg, 0, sizeof(cfg) );
+        struct tle_stream_cb cb;
+        memset( &cb, 0, sizeof(cb) );
+
+        cfg.nb_retries = TCP_RETRIES;
+        cb.func = session_read_cb;
+        cb.data = NULL;
+        cfg.recv_cb = cb;
+        cb.func = session_error_cb;
+        cfg.err_cb = cb;
+        tle_tcp_stream_update_cfg(&new_stream, &cfg, 1);
+    } while(0);
+
+    printf("Connection opened\n");
 }
 
 static struct tle_stream *tcp_listen_stream;
@@ -1426,6 +1492,8 @@ static int tldk_init(void)
     if( res!=0 ) {
 	rte_exit(EXIT_FAILURE, "Error: Failed to set listen mode on socket: %d\n", rte_errno);
     }
+
+    printf("Listening stream %p\n", tcp_listen_stream);
 
     return 0;
 }
