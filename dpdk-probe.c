@@ -1112,7 +1112,7 @@ lcore_main(void)
 		uint16_t num_processed = tle_tcp_rx_bulk(local_ports[p].tle_dev, tcp_packets, unprocessed_packets, rc, num_tcp_packets);
 		uint16_t sad_discarded_packets;
 		for( sad_discarded_packets=0; sad_discarded_packets < num_tcp_packets-num_processed; ++sad_discarded_packets ) {
-                    fprintf(stderr, "Dropped incoming packet: %s\n", strerror(rc[sad_discarded_packets]));
+                    fprintf(stderr, "Dropped incoming packet: %d(%s)\n", rc[sad_discarded_packets], strerror(rc[sad_discarded_packets]));
 		    rte_pktmbuf_free(unprocessed_packets[sad_discarded_packets]);
 		}
 	    }
@@ -1470,12 +1470,11 @@ static int tldk_init(void)
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = local_ports[0].addr.ip.s_addr;
+    addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(LISTENING_PORT);
 
     memcpy( &params.addr.local, &addr, sizeof(addr) );
 
-    addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(0);
     memcpy( &params.addr.remote, &addr, sizeof(addr) );
 
