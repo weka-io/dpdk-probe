@@ -37,10 +37,10 @@
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
-#define MBUF_SIZE (8 * 1024)
-#define NUM_MBUFS (4096 * 4)
-#define MBUF_CACHE_SIZE 250
-#define BURST_SIZE 32
+#define MBUF_SIZE (6 * 1024)
+#define NUM_MBUFS (4 * 1024)
+#define MBUF_CACHE_SIZE 0
+#define BURST_SIZE 128
 #define MAX_LOCAL_PORTS 4
 #define MAX_PEERS 128
 #define MAX_FRAME_SIZE ((MBUF_SIZE) - 512)
@@ -161,7 +161,7 @@ static int      udp_jam = 0;
 static int      no_dump = 0;
 static int      no_dump_arp = 1;
 static int      burst = 1;
-static int      verify_payload = 0;
+static int      verify_payload = 1;
 static int      unlimited = 1;
 static int      rounds = 0;
 static uint16_t udp_port = DEFAULT_UPD_PORT;
@@ -304,6 +304,7 @@ static void dump_ip_data(const struct rte_mbuf *mbuf,
                     fprintf(stdout,
                             "BAD CSUM pkt:0x%x local:0x%x ",
                             udp_csum, local_udp_csum);
+			_exit(-131);
                 }
             }
 
@@ -1182,7 +1183,7 @@ static int dpdk_init(int argc, char **argv)
     signal(SIGINT, signal_handler);
 
     //rte_set_log_level(RTE_LOG_DEBUG);
-    rte_set_log_type(0xffffffff, 1);
+    //rte_set_log_type(0xffffffff, 1);
     int p, argn = rte_eal_init(argc, argv);
 	if (argn < 0)
 		rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
