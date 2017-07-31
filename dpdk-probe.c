@@ -20,6 +20,7 @@
 #include <rte_mbuf.h>
 #include <rte_timer.h>
 #include <rte_hexdump.h>
+#include <rte_common.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -32,13 +33,11 @@
 #include <getopt.h>
 #include <time.h>
 
-#include "dpdk-probe.h"
-
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
 #define MBUF_SIZE (6 * 1024)
-#define NUM_MBUFS (4 * 1024)
+#define NUM_MBUFS (500 * 1024)
 #define MBUF_CACHE_SIZE 0
 #define BURST_SIZE 128
 #define MAX_LOCAL_PORTS 4
@@ -192,6 +191,8 @@ static void pkt_assemble_none(struct rte_mbuf **mbuf, struct peer *peer, enum da
 static void pkt_assemble_udp(struct rte_mbuf **mbuf, struct peer *peer, enum data_ops_e op, int burst);
 static void pkt_assemble_icmp_request(struct rte_mbuf **mbuf, struct peer *peer, enum data_ops_e op, int burst);
 static void roce_init(void);
+
+struct rte_mempool *weka_init_mbuf_pool(uint32_t mbufs_count);
 
 static const struct  {
 	const char *name;
@@ -380,6 +381,20 @@ static int do_icmp_request(int port_id, struct rte_mbuf *mbuf)
     return (ret == 1) ? 0 : 1; 
 }
 
+static inline int validate_udp_csum(struct ipv4_hdr *ip, struct udp_hdr *udp)
+{
+    uint16_t udp_csum = udp->dgram_cksum;
+    uint16_t local_udp_csum;
+
+    udp->dgram_cksum = 0;
+    local_udp_csum = rte_ipv4_udptcp_cksum(ip, udp);
+    udp->dgram_cksum = udp_csum;
+    if (local_udp_csum != udp_csum) {
+        fprintf(stderr, "UDP RX checksum got x%x calculated x%x\n", udp_csum, local_udp_csum);
+    }
+    return local_udp_csum == udp_csum; 
+}
+
 static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf)
 {
     int free_mbuf = 1;
@@ -394,6 +409,10 @@ static inline int process_incoming_ip(int port_id, struct rte_mbuf *mbuf)
     switch (ip->next_proto_id) {
         case IPPROTO_UDP: {
             struct udp_hdr *udp = (struct udp_hdr *)(ip + 1);
+            if (!validate_udp_csum(ip, udp)) {
+                rte_pktmbuf_dump(stderr, mbuf, mbuf->buf_len);
+                exit(-131);
+            }
                 struct udp_ping_data *data = (struct udp_ping_data *)(udp + 1);
                 if (data->op == OP_REQUEST) {
                     rte_pktmbuf_reset(mbuf);
@@ -586,8 +605,17 @@ static void process_rx(int port_id, struct rte_mbuf *mbuf)
     }
 
     if (free_mbuf) {
-        if (DEBUG) printf("DEBUG: release incoming mbuf %p\n", mbuf);
-        rte_pktmbuf_free(mbuf);
+        static struct rte_mbuf *rx_stash = NULL;
+        static uint32_t rx_stash_size = 0;
+        mbuf->next = rx_stash;
+        rx_stash = mbuf;
+        if (++rx_stash_size >= mbuf->pool->populated_size - 4096) {
+                    printf("DEBUG: release mbuf stash size %u\n", rx_stash_size);
+                    rte_pktmbuf_free(rx_stash);
+                    rx_stash = NULL;
+                    rx_stash_size = 0;
+        }
+
     }
 }
 
@@ -1202,9 +1230,8 @@ static int dpdk_init(int argc, char **argv)
     }
 
 
-#if 0
-    mbuf_pool = weka_init_mbuf_pool(NUM_MBUFS * nb_ports, 512, MBUF_SIZE, 0, 0, rte_socket_id(),
-        "WEKA POOL", RTE_MBUF_DEFAULT_MEMPOOL_OPS);
+#if 1
+    mbuf_pool = weka_init_mbuf_pool(NUM_MBUFS * nb_ports);
 #else
     mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,
                     MBUF_CACHE_SIZE, 0, MBUF_SIZE, rte_socket_id());
@@ -1540,4 +1567,71 @@ int main(int argc, char **argv)
     __dbg_check_mbuf();
 
 	lcore_main();
+}
+
+static void weka_mempool_dump(struct rte_mempool *mp)
+{
+    printf("mempool <%s>@%p\n", mp->name, mp);
+    printf("  flags=%x\n", mp->flags);
+    printf("  pool=%p\n", mp->pool_data);
+    printf("  phys_addr=0x%lx\n", mp->mz->phys_addr);
+    printf("  nb_mem_chunks=%u\n", mp->nb_mem_chunks);
+    printf("  size=%u\n", mp->size);
+    printf("  populated_size=%u\n", mp->populated_size);
+    printf("  header_size=%u\n", mp->header_size);
+    printf("  elt_size=%u\n", mp->elt_size);
+    printf("  elt_align=%u\n", mp->elt_align);
+    printf("  trailer_size=%u\n", mp->trailer_size);
+    printf("  total_obj_size=%u\n",
+           mp->header_size + mp->elt_size + mp->trailer_size);
+    printf("  private_data_size=%u\n", mp->private_data_size);
+    printf("  ops: \"%s\"\n", rte_mempool_get_ops(mp->ops_index)->name);
+}
+
+#define DATA_SZ 4096
+#define EXPECTED_PROTO_SZ 90
+struct rte_mempool *weka_init_mbuf_pool(uint32_t mbufs_count)
+{
+
+    uint32_t align = 512;
+    uint32_t priv_size = 0;
+    uint32_t cache_size = 0;
+    uint32_t data_room_size = RTE_ALIGN_CEIL(DATA_SZ + EXPECTED_PROTO_SZ, 1024) + RTE_PKTMBUF_HEADROOM;
+
+    struct rte_pktmbuf_pool_private mbp_priv = {
+        .mbuf_data_room_size = data_room_size,
+        .mbuf_priv_size = priv_size
+    };
+
+    if (RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) != priv_size) {
+        printf("mbuf priv_size=%u is not aligned\n", priv_size);
+        rte_errno = EINVAL;
+        return NULL;
+    }
+    uint32_t elt_size = sizeof(struct rte_mbuf) + priv_size + data_room_size;
+
+    struct rte_mempool *mp = rte_mempool_create_empty("WEKA MBUF pool", mbufs_count, elt_size, cache_size,
+         sizeof(struct rte_pktmbuf_pool_private), rte_socket_id(), 0);
+    if (mp == NULL)
+        return NULL;
+
+    const char pool_ops[] = "ring_sp_sc";
+    void *pool_config = NULL;
+    rte_errno = rte_mempool_set_ops_byname(mp, pool_ops, pool_config);
+    if (rte_errno != 0) {
+        printf("failed to set mempool handler %s (%d)\n", pool_ops, rte_errno);
+        return NULL;
+    }
+    rte_pktmbuf_pool_init(mp, &mbp_priv);
+	mp->elt_align = align;
+
+    int ret = rte_mempool_populate_default(mp);
+    if (ret < 0) {
+        rte_mempool_free(mp);
+        rte_errno = -ret;
+        return NULL;
+    }
+    rte_mempool_obj_iter(mp, rte_pktmbuf_init, NULL);
+    weka_mempool_dump(mp);
+    return mp;
 }
