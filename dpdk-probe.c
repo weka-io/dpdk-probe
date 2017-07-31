@@ -160,7 +160,7 @@ static int      udp_jam = 0;
 static int      no_dump = 0;
 static int      no_dump_arp = 1;
 static int      burst = 1;
-static int      verify_payload = 1;
+static int      verify_payload = 0;
 static int      unlimited = 1;
 static int      rounds = 0;
 static uint16_t udp_port = DEFAULT_UPD_PORT;
@@ -1063,25 +1063,6 @@ lcore_main(void)
     }
 }
 
-static void
-lsi_event_callback(uint8_t port_id, enum rte_eth_event_type type, void *param)
-{
-	struct rte_eth_link link;
-
-	RTE_SET_USED(param);
-
-	printf("\n\nIn registered callback...\n");
-	printf("Event type: %s\n", type == RTE_ETH_EVENT_INTR_LSC ? "LSC interrupt" : "unknown event");
-	rte_eth_link_get_nowait(port_id, &link);
-	if (link.link_status) {
-		printf("Port %d Link Up - speed %u Mbps - %s\n\n",
-				port_id, (unsigned)link.link_speed,
-			(link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
-				("full-duplex") : ("half-duplex"));
-	} else
-		printf("Port %d Link Down\n\n", port_id);
-}
-
 /* RX ring configuration */
 static const struct rte_eth_rxconf rx_conf = {
         .rx_thresh = {
@@ -1121,15 +1102,6 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &local_ports[port].eth_conf);
 	if (retval != 0)
 		return retval;
-
-    /* register lsi interrupt callback, need to be after
-     * rte_eth_dev_configure(). if (intr_conf.lsc == 0), no
-     * lsc interrupt will be present, and below callback to
-     * be registered will never be called.
-     */
-    rte_eth_dev_callback_register(port,
-        RTE_ETH_EVENT_INTR_LSC, lsi_event_callback, NULL);
-
 
 	/* Allocate and set up 1 RX queue per Ethernet port. */
 	for (q = 0; q < rx_rings; q++) {
@@ -1580,7 +1552,6 @@ static void weka_mempool_dump(struct rte_mempool *mp)
     printf("  populated_size=%u\n", mp->populated_size);
     printf("  header_size=%u\n", mp->header_size);
     printf("  elt_size=%u\n", mp->elt_size);
-    printf("  elt_align=%u\n", mp->elt_align);
     printf("  trailer_size=%u\n", mp->trailer_size);
     printf("  total_obj_size=%u\n",
            mp->header_size + mp->elt_size + mp->trailer_size);
@@ -1593,7 +1564,6 @@ static void weka_mempool_dump(struct rte_mempool *mp)
 struct rte_mempool *weka_init_mbuf_pool(uint32_t mbufs_count)
 {
 
-    uint32_t align = 512;
     uint32_t priv_size = 0;
     uint32_t cache_size = 0;
     uint32_t data_room_size = RTE_ALIGN_CEIL(DATA_SZ + EXPECTED_PROTO_SZ, 1024) + RTE_PKTMBUF_HEADROOM;
@@ -1623,7 +1593,6 @@ struct rte_mempool *weka_init_mbuf_pool(uint32_t mbufs_count)
         return NULL;
     }
     rte_pktmbuf_pool_init(mp, &mbp_priv);
-	mp->elt_align = align;
 
     int ret = rte_mempool_populate_default(mp);
     if (ret < 0) {
