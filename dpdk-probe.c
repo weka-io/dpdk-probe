@@ -780,6 +780,7 @@ static void pkt_assemble_udp(struct rte_mbuf **mbuf, struct peer *peer, enum dat
         format_udp_ping(uping, peer, data_size, op); 
 
         //checksum offload
+        mbuf[i]->packet_type |= RTE_PTYPE_L4_NONFRAG;
         mbuf[i]->ol_flags = PKT_TX_IPV4 | PKT_TX_IP_CKSUM | PKT_TX_UDP_CKSUM;
 #if 1
         mbuf[i]->l2_len = sizeof(struct ether_hdr);
