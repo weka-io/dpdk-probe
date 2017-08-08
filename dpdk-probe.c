@@ -37,7 +37,7 @@
 #define TX_RING_SIZE 1024
 
 #define MBUF_SIZE (6 * 1024)
-#define NUM_MBUFS (500 * 1024)
+#define NUM_MBUFS 715000
 #define MBUF_CACHE_SIZE 0
 #define BURST_SIZE 128
 #define MAX_LOCAL_PORTS 4
@@ -674,7 +674,7 @@ static void format_udp_ping(struct udp_ping_data *data, struct peer *peer,
 {
     data->seq = peer->sequence++;
     data->op = op;
-    if (verify_payload && (op == OP_REQUEST)) {
+    if (op == OP_REQUEST) {
         int i;
         for (i = 0; i < size - 64; i++) data->uint8_data[i] = (uint8_t)i;
     }
