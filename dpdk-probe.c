@@ -1034,25 +1034,6 @@ lcore_main(void)
     }
 }
 
-static void
-lsi_event_callback(uint8_t port_id, enum rte_eth_event_type type, void *param)
-{
-	struct rte_eth_link link;
-
-	RTE_SET_USED(param);
-
-	printf("\n\nIn registered callback...\n");
-	printf("Event type: %s\n", type == RTE_ETH_EVENT_INTR_LSC ? "LSC interrupt" : "unknown event");
-	rte_eth_link_get_nowait(port_id, &link);
-	if (link.link_status) {
-		printf("Port %d Link Up - speed %u Mbps - %s\n\n",
-				port_id, (unsigned)link.link_speed,
-			(link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
-				("full-duplex") : ("half-duplex"));
-	} else
-		printf("Port %d Link Down\n\n", port_id);
-}
-
 /* RX ring configuration */
 static const struct rte_eth_rxconf rx_conf = {
         .rx_thresh = {
@@ -1092,15 +1073,6 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &local_ports[port].eth_conf);
 	if (retval != 0)
 		return retval;
-
-    /* register lsi interrupt callback, need to be after
-     * rte_eth_dev_configure(). if (intr_conf.lsc == 0), no
-     * lsc interrupt will be present, and below callback to
-     * be registered will never be called.
-     */
-    rte_eth_dev_callback_register(port,
-        RTE_ETH_EVENT_INTR_LSC, lsi_event_callback, NULL);
-
 
 	/* Allocate and set up 1 RX queue per Ethernet port. */
 	for (q = 0; q < rx_rings; q++) {
@@ -1181,8 +1153,6 @@ static int dpdk_init(int argc, char **argv)
 {
     signal(SIGINT, signal_handler);
 
-    //rte_set_log_level(RTE_LOG_DEBUG);
-    rte_set_log_type(0xffffffff, 1);
     int p, argn = rte_eal_init(argc, argv);
 	if (argn < 0)
 		rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
